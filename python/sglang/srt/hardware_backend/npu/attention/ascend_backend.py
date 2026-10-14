@@ -1342,6 +1342,80 @@ class AscendAttnBackend(AttentionBackend):
         attn_out = torch.cat([attn_out_prev, attn_out_next], dim=0)
         return attn_out.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
+    def _iquest_attn_with_lse(
+        self,
+        q: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        num_token_padding: int,
+    ):
+        """Plain (sink-free) attention that also returns the softmax LSE.
+
+        Learned-sink models (IQuest-Q1) apply their sink key outside the
+        attention op, which needs the LSE of the *unmodified* softmax.  TND
+        layout covers both prefill and decode, so one implementation serves
+        both entry points.
+        """
+        is_decode = forward_batch.forward_mode.is_decode()
+        if is_decode:
+            real_num_tokens = num_token_padding
+            actual_seq_qlen = [i + 1 for i in range(num_token_padding)]
+            actual_seq_kvlen = self.forward_metadata.seq_lens_cpu_list
+            if actual_seq_kvlen is None:
+                actual_seq_kvlen = (
+                    self.forward_metadata.seq_lens_cpu_int.cpu().int().tolist()
+                )
+        else:
+            real_num_tokens = forward_batch.global_num_token_non_padded_cpu
+            actual_seq_qlen = self.forward_metadata.seq_lens_list_cumsum
+            actual_seq_kvlen = self.forward_metadata.seq_lens_cpu_int
+
+        q = q[:real_num_tokens].reshape(-1, layer.tp_q_head_num, layer.qk_head_dim)
+
+        block_tables = (
+            self.forward_metadata.block_tables_swa
+            if self._is_swa_layer(layer)
+            else self.forward_metadata.block_tables
+        )
+        sliding = layer.sliding_window_size != -1
+
+        attn_out, lse = torch_npu.npu_fused_infer_attention_score_v2(
+            query=q,
+            key=k_cache.view(
+                -1, self.page_size, layer.tp_k_head_num * layer.qk_head_dim
+            ),
+            value=v_cache.view(
+                -1, self.page_size, layer.tp_v_head_num * layer.v_head_dim
+            ),
+            pre_tokens=(
+                layer.sliding_window_size if sliding else FULL_ATTENTION_WINDOW
+            ),
+            next_tokens=0 if sliding else FULL_ATTENTION_WINDOW,
+            atten_mask=self.fia_mask,
+            block_table=block_tables,
+            input_layout="TND",
+            block_size=self.page_size,
+            num_query_heads=layer.tp_q_head_num,
+            num_key_value_heads=layer.tp_k_head_num,
+            actual_seq_qlen=actual_seq_qlen,
+            actual_seq_kvlen=actual_seq_kvlen,
+            softmax_scale=layer.scaling,
+            sparse_mode=4 if sliding else 3,
+            return_softmax_lse=True,
+        )
+        attn_out = attn_out.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+        # TND returns lse as (T, Q_N, 1); the learned-sink kernel wants (T, Q_N).
+        lse = lse.reshape(-1, layer.tp_q_head_num)
+        if attn_out.shape[0] != num_token_padding:
+            pad = num_token_padding - attn_out.shape[0]
+            attn_out = torch.cat(
+                [attn_out, attn_out.new_zeros(pad, *attn_out.shape[1:])], dim=0
+            )
+            lse = torch.cat([lse, lse.new_zeros(pad, *lse.shape[1:])], dim=0)
+        return attn_out, lse
+
     def forward_sparse(
         self,
         q: torch.Tensor,
@@ -1507,6 +1581,7 @@ class AscendAttnBackend(AttentionBackend):
         topk_indices: Optional[torch.Tensor] = None,
         sinks: Optional[torch.Tensor] = None,
         slopes: Optional[torch.Tensor] = None,
+        return_lse: bool = False,
     ):
         if is_mla_preprocess_enabled() and self.use_mla:
             # DSA callers set save_kv_cache based on whether preprocessing was used.
@@ -1608,6 +1683,10 @@ class AscendAttnBackend(AttentionBackend):
 
             k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
             v_cache = self.token_to_kv_pool.get_value_buffer(layer.layer_id)
+            if return_lse:
+                return self._iquest_attn_with_lse(
+                    q, layer, forward_batch, k_cache, v_cache, q.shape[0]
+                )
 
             if sinks is not None or (self._is_swa_layer(layer) and self.use_fia):
                 # Use SWA block tables if hybrid SWA is enabled for this layer
@@ -2975,6 +3054,9 @@ class AscendAttnBackend(AttentionBackend):
         slopes: Optional[torch.Tensor] = None,
         **kwargs,
     ):
+        return_lse = bool(kwargs.get("return_lse")) or bool(
+            getattr(forward_batch, "mha_return_lse", False)
+        )
         if is_mla_preprocess_enabled() and self.use_mla:
             # DSA callers set save_kv_cache based on whether preprocessing was used.
             # Only override it for the existing non-sparse MLA path.
@@ -3046,6 +3128,10 @@ class AscendAttnBackend(AttentionBackend):
             num_tokens = q.shape[0]
             k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
             v_cache = self.token_to_kv_pool.get_value_buffer(layer.layer_id)
+            if return_lse:
+                return self._iquest_attn_with_lse(
+                    q, layer, forward_batch, k_cache, v_cache, num_tokens
+                )
 
             if sinks is not None or (self._is_swa_layer(layer) and self.use_fia):
                 # Use SWA block tables if hybrid SWA is enabled for this layer

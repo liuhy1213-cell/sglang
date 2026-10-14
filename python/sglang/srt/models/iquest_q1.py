@@ -6,7 +6,10 @@ import triton
 import triton.language as tl
 from torch import nn
 from transformers import PretrainedConfig
-from triton.language.extra import libdevice
+try:  # triton-ascend does not ship the CUDA libdevice module
+    from triton.language.extra import libdevice
+except ImportError:  # pragma: no cover - NPU fallback path
+    libdevice = None
 
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.dp_attention import reject_attn_tp_shard_with_tp_reduce
@@ -124,6 +127,27 @@ def _apply_learned_sink_kernel(
     )
 
 
+def _apply_learned_sink_torch(
+    query: torch.Tensor,
+    sink_key: torch.Tensor,
+    attn_output: torch.Tensor,
+    lse: torch.Tensor,
+    scale: float,
+) -> torch.Tensor:
+    """Torch fallback for the learned-sink correction.
+
+    Mirrors ``_apply_learned_sink_kernel`` exactly: the sink is an
+    always-visible entry with a zero value, so it only rescales the softmax
+    denominator by ``sigmoid(lse - sink_logit)``.  Used on NPU, where the CUDA
+    Triton kernel is unavailable.
+    """
+    group = query.shape[1] // sink_key.shape[0]
+    sink = sink_key.to(query.dtype).repeat_interleave(group, dim=0)
+    sink_logit = (query.float() * sink.float()).sum(-1) * scale
+    factor = torch.sigmoid(lse.float() - sink_logit)
+    return (attn_output.float() * factor.unsqueeze(-1)).to(attn_output.dtype)
+
+
 def _apply_learned_sink(
     query: torch.Tensor,
     sink_key: torch.Tensor,
@@ -131,6 +155,10 @@ def _apply_learned_sink(
     lse: torch.Tensor,
     scale: float,
 ) -> torch.Tensor:
+    if query.device.type == "npu" or libdevice is None:
+        return _apply_learned_sink_torch(
+            query, sink_key, attn_output, lse, scale
+        )
     num_tokens, num_heads, head_dim = query.shape
     assert attn_output.shape == query.shape
     assert sink_key.ndim == 2 and sink_key.shape[1] == head_dim
