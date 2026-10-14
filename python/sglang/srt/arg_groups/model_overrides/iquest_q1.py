@@ -6,17 +6,25 @@ from sglang.srt.arg_groups.model_override_base import (
     resolving_view,
 )
 from sglang.srt.runtime_context import attn_dp_enabled_of
+from sglang.srt.utils.common import is_npu
 
 
 @_register_for("IQuestQ1ForCausalLM", "IQuestQ1MTP")
 def _iquest_q1_overrides(server_args: Any, hf_config: Any) -> dict:
     cfg = resolving_view(server_args)
+    # On Ascend NPU the LSE comes from the native attention backend
+    # (AscendAttnBackend returns it via return_lse), so the FA3
+    # requirement below does not apply -- and must not force
+    # attention_backend="fa3".
+    on_npu = is_npu()
     requested = (
         cfg.attention_backend,
         cfg.prefill_attention_backend,
         cfg.decode_attention_backend,
     )
-    if any(backend not in (None, "fa3") for backend in requested):
+    if not on_npu and any(
+        backend not in (None, "fa3") for backend in requested
+    ):
         raise ValueError(
             "IQuestQ1 applies its attention sink from the softmax LSE and "
             "requires FA3 attention for both prefill and decode."
@@ -38,6 +46,9 @@ def _iquest_q1_overrides(server_args: Any, hf_config: Any) -> dict:
         raise ValueError("IQuest Q1 does not support DP attention.")
     if cfg.pp_size > 1:
         raise ValueError("IQuest Q1 does not support pipeline parallelism.")
+    if on_npu:
+        # Keep the NPU backend selection untouched.
+        return {}
     overrides = {}
     if is_attention_backend_not_set(cfg):
         overrides["attention_backend"] = "fa3"
