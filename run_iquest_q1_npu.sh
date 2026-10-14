@@ -22,6 +22,11 @@ SERVED_NAME="IQuest-Q1"
 # 权重 320B × 2B = 640GB，TP=8 时每卡 ~80GB。
 # 96GB 卡 → 占 83%，很紧；上下文必须压低（见 max-model-len）。
 TP="${TP:-8}"
+EP="${EP:-8}"              # --ep / --expert-parallel-size：MoE 专家并行
+# 参数名已核对 sglang/srt/arg_groups/fields/：
+#   tp_size -> --tp-size（别名 --tensor-parallel-size），没有 --tp 短名
+#   ep_size -> --ep-size（别名 --expert-parallel-size / --ep）
+#   context_length -> --context-length
 # 注意：--ep-size 在 sglang 里不存在（我在 server_args.py 里查过，没有这个字段）。
 # 专家并行的开关名请用下面这条确认后再加，别猜：
 #   python -m sglang.launch_server --help | grep -iE "ep|expert|moe"
@@ -33,7 +38,7 @@ TP="${TP:-8}"
 # 权重就吃掉 ~83%，留给 KV / 激活 / 框架的余量很小。
 # 先给 0.8 试；OOM 就往下调，或者把 max-model-len 再压低。
 MEM_FRACTION="${MEM_FRACTION:-0.8}"
-MAX_MODEL_LEN="${MAX_MODEL_LEN:-8192}"   # 先别上 512K，KV 预算没规划过
+CONTEXT_LEN="${CONTEXT_LEN:-8192}"     # --context-length（不是 vLLM 的 --max-model-len）
 
 # ---------------------------------------------------------------------------
 # 4) 环境
@@ -62,9 +67,10 @@ export PYTHONWARNINGS="${PYTHONWARNINGS:-ignore::UserWarning}"
 python -m sglang.launch_server \
   --model-path "${MODEL_PATH}" \
   --served-model-name "${SERVED_NAME}" \
-  --tp "${TP}" \
+  --tp-size "${TP}" \
+  --ep "${EP}" \
   --mem-fraction-static "${MEM_FRACTION}" \
-  --max-model-len "${MAX_MODEL_LEN}" \
+  --context-length "${CONTEXT_LEN}" \
   --disable-cuda-graph \
   --disable-prefill-cuda-graph \
   --reasoning-parser iquest_q1 \
