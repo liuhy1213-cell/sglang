@@ -22,7 +22,9 @@ SERVED_NAME="IQuest-Q1"
 # 权重 320B × 2B = 640GB，TP=8 时每卡 ~80GB。
 # 96GB 卡 → 占 83%，很紧；上下文必须压低（见 max-model-len）。
 TP="${TP:-8}"
-EP="${EP:-8}"              # --ep / --expert-parallel-size：MoE 专家并行
+EP="${EP:-}"               # 默认不传。--tp-size 8 已按 TP 切分专家（256/8=32 个/卡）；
+#                            再叠 --ep 会让 group_list(256) 与本地权重(32)对不上，报 npu_grouped_matmul 161002。
+#                            要开 EP 请自行确认 tp*ep == 卡数。
 # 参数名已核对 sglang/srt/arg_groups/fields/：
 #   tp_size -> --tp-size（别名 --tensor-parallel-size），没有 --tp 短名
 #   ep_size -> --ep-size（别名 --expert-parallel-size / --ep）
@@ -68,7 +70,7 @@ python -m sglang.launch_server \
   --model-path "${MODEL_PATH}" \
   --served-model-name "${SERVED_NAME}" \
   --tp-size "${TP}" \
-  --ep "${EP}" \
+  ${EP:+--ep ${EP}} \
   --mem-fraction-static "${MEM_FRACTION}" \
   --context-length "${CONTEXT_LEN}" \
   --disable-cuda-graph \
@@ -104,3 +106,4 @@ python -m sglang.launch_server \
 # [5] 验证 sink 真的生效（最关键的一步）：
 #     把 iquest_q1.py 里 enable_sink_attention 强制置 False 再跑同一个
 #     temperature=0 的 prompt，输出必须不一样。一样就说明 sink 没起作用。
+
