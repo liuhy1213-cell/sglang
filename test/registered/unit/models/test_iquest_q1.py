@@ -219,5 +219,59 @@ class TestIQuestQ1MTPDraft(CustomTestCase):
             torch.testing.assert_close(result, expected)
 
 
+class TestIQuestQ1LearnedSinkTorch(CustomTestCase):
+    """The NPU (torch) sink correction must match a joint-softmax reference."""
+
+    def test_matches_joint_softmax_with_zero_value_sink(self):
+        try:
+            from sglang.srt.models.iquest_q1 import _apply_learned_sink_torch
+        except ImportError as exc:  # triton is imported at module scope
+            self.skipTest(f"triton unavailable: {exc}")
+
+        torch.manual_seed(0)
+        num_tokens, num_heads, num_kv_heads, head_dim = 3, 4, 2, 8
+        num_keys = 5
+        group = num_heads // num_kv_heads
+        scale = 0.125
+
+        query = torch.randn(num_tokens, num_heads, head_dim)
+        sink_key = torch.randn(num_kv_heads, head_dim)
+        values = torch.randn(num_keys, head_dim)
+
+        # One key per head, shared by the query heads in the same GQA group.
+        attn_output = torch.empty(num_tokens, num_heads, head_dim)
+        lse = torch.empty(num_tokens, num_heads)
+        expected = torch.empty_like(attn_output)
+        for h in range(num_heads):
+            kv_head = h // group
+            logits = (query[:, h, :] @ values.T) * scale
+            lse[:, h] = torch.logsumexp(logits, dim=-1)
+            attn_output[:, h, :] = torch.softmax(logits, dim=-1) @ values
+            sink_logit = (query[:, h, :] * sink_key[kv_head]).sum(-1) * scale
+            # The sink entry has value zero: appending it to the softmax and
+            # dropping its (zero) contribution is the exact semantics.
+            joint = torch.softmax(
+                torch.cat([logits, sink_logit.unsqueeze(-1)], dim=-1), dim=-1
+            )
+            expected[:, h, :] = joint[:, :-1] @ values
+
+        result = _apply_learned_sink_torch(query, sink_key, attn_output, lse, scale)
+
+        torch.testing.assert_close(result, expected, atol=1e-5, rtol=1e-5)
+
+    def test_preserves_attn_output_dtype(self):
+        try:
+            from sglang.srt.models.iquest_q1 import _apply_learned_sink_torch
+        except ImportError as exc:
+            self.skipTest(f"triton unavailable: {exc}")
+
+        query = torch.randn(2, 4, 8, dtype=torch.bfloat16)
+        sink_key = torch.randn(2, 8)
+        attn_output = torch.randn(2, 4, 8, dtype=torch.bfloat16)
+        lse = torch.randn(2, 4)
+        result = _apply_learned_sink_torch(query, sink_key, attn_output, lse, 0.1)
+        self.assertEqual(result.dtype, torch.bfloat16)
+
+
 if __name__ == "__main__":
     unittest.main()

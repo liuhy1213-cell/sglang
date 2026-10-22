@@ -13,6 +13,50 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 
+def test_graph_uses_fia_v2_for_iquest_with_sink():
+    """IQuest-Q1's graph LSE path is FIA v2, so replay must rebind v2 names."""
+    hf_config = SimpleNamespace(
+        architectures=["IQuestQ1ForCausalLM"], enable_sink_attention=True
+    )
+    assert mod._graph_uses_fia_v2(SimpleNamespace(hf_config=hf_config))
+
+
+def test_graph_does_not_use_fia_v2_for_iquest_without_sink():
+    hf_config = SimpleNamespace(
+        architectures=["IQuestQ1ForCausalLM"], enable_sink_attention=False
+    )
+    assert not mod._graph_uses_fia_v2(SimpleNamespace(hf_config=hf_config))
+
+
+def test_graph_uses_fia_v2_for_known_archs_only():
+    assert mod._graph_uses_fia_v2(
+        SimpleNamespace(
+            hf_config=SimpleNamespace(
+                architectures=["MiMoV2FlashForCausalLM"], enable_sink_attention=False
+            )
+        )
+    )
+    assert not mod._graph_uses_fia_v2(
+        SimpleNamespace(
+            hf_config=SimpleNamespace(
+                architectures=["LlamaForCausalLM"], enable_sink_attention=False
+            )
+        )
+    )
+
+
+def test_iquest_v2_update_uses_actual_seq_kvlen_key():
+    runner = mod.NPUGraphRunner.__new__(mod.NPUGraphRunner)
+    runner.is_dllm = False
+    runner.if_use_v2 = True
+    runner.use_fias_v2_bsnd = False
+    runner.capture_forward_mode = SimpleNamespace(is_target_verify=lambda: False)
+    runner._init_arch_map()
+
+    assert runner._get_update_attr_name() == "actual_seq_kvlen"
+    assert runner._get_update_attr_type() == []
+
+
 def test_replay_updates_sequence_lengths_and_slices_logits_to_raw_batch():
     runner = mod.NPUGraphRunner.__new__(mod.NPUGraphRunner)
     runner.require_mlp_tp_gather = False

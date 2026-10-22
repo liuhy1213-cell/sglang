@@ -63,6 +63,27 @@ if is_npu:
 
 logger = logging.getLogger(__name__)
 
+
+# Architectures whose captured decode graph binds FIA v2, i.e. whose host-side
+# KV-length input is recorded under the v2 name "actual_seq_kvlen" and must be
+# rebound with that key at replay (v1 uses "actual_seq_lengths_kv").
+_GRAPH_FIA_V2_ARCHS = (
+    "MiMoV2ForCausalLM",
+    "MiMoV2FlashForCausalLM",
+    "Step3p5ForCausalLM",
+)
+
+
+def _graph_uses_fia_v2(model_config) -> bool:
+    hf_config = model_config.hf_config
+    archs = hf_config.architectures or []
+    if "IQuestQ1ForCausalLM" in archs:
+        # The graph LSE path only exists while the learned sink is enabled;
+        # without it the capture takes the Triton-sinks branch instead.
+        return bool(getattr(hf_config, "enable_sink_attention", False))
+    return any(arch in _GRAPH_FIA_V2_ARCHS for arch in archs)
+
+
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
@@ -126,11 +147,7 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
         # valid when per-rank batch sizes diverge.
         self._init_arch_map()
         self.use_fia = get_bool_env_var("ASCEND_USE_FIA", "False")
-        self.if_use_v2 = any(
-            arch
-            in ("MiMoV2ForCausalLM", "MiMoV2FlashForCausalLM", "Step3p5ForCausalLM")
-            for arch in (model_runner.model_config.hf_config.architectures or [])
-        )
+        self.if_use_v2 = _graph_uses_fia_v2(model_runner.model_config)
         self.use_fias_v2_bsnd = (
             envs.SGLANG_NPU_USE_FIAS_V2_BSND.get()
             and model_runner.spec_algorithm.is_dspark()

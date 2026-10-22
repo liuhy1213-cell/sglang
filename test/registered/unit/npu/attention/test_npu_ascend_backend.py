@@ -4,7 +4,8 @@ Unit tests for sglang.srt.hardware_backend.npu.attention.ascend_backend.
 
 import sys
 import unittest
-from unittest.mock import MagicMock
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 import torch
 
@@ -26,7 +27,11 @@ for _ in (
 ):
     sys.modules.setdefault(_, MagicMock())
 
+from sglang.srt.hardware_backend.npu.attention import (
+    ascend_backend as ascend_backend_mod,
+)
 from sglang.srt.hardware_backend.npu.attention.ascend_backend import (
+    FULL_ATTENTION_WINDOW,
     AscendAttnBackend,
     AscendAttnMaskBuilder,
     _expand_dsa_sparse_indices,
@@ -552,6 +557,170 @@ class TestGenerateAlibiBias(unittest.TestCase):
             device=torch.device("cpu"),
         )
         self.assertEqual(result.dtype, torch.bfloat16)
+
+
+class TestIQuestGraphLse(unittest.TestCase):
+    """Graph decode must produce the LSE the learned sink consumes."""
+
+    def _backend(self):
+        backend = object.__new__(AscendAttnBackend)
+        backend.use_mla = False
+        backend.graph_mode = True
+        backend.enable_torch_compile = False
+        backend.page_size = 128
+        backend._is_swa_layer = lambda layer: layer.sliding_window_size != -1
+        return backend
+
+    def test_forward_decode_forwards_return_lse_to_graph_path(self):
+        backend = self._backend()
+        backend.forward_decode_graph = MagicMock(return_value=("out", "lse"))
+        q = torch.zeros(2, 8)
+
+        result = backend.forward_decode(
+            q, q, q, layer=None, forward_batch=None, return_lse=True
+        )
+
+        self.assertEqual(result, ("out", "lse"))
+        backend.forward_decode_graph.assert_called_once()
+        self.assertTrue(backend.forward_decode_graph.call_args.kwargs["return_lse"])
+
+    def test_forward_decode_ignores_mha_return_lse_for_graph(self):
+        """mha_return_lse is the MLA prefix-merge signal, not the model kwarg."""
+        backend = self._backend()
+        backend.forward_decode_graph = MagicMock(return_value="out")
+        q = torch.zeros(2, 8)
+        forward_batch = SimpleNamespace(mha_return_lse=True)
+
+        backend.forward_decode(q, q, q, layer=None, forward_batch=forward_batch)
+
+        self.assertFalse(backend.forward_decode_graph.call_args.kwargs["return_lse"])
+
+    def test_forward_decode_graph_calls_lse_helper_after_kv_write(self):
+        backend = self._backend()
+        pool = MagicMock()
+        pool.get_key_buffer.return_value = torch.zeros(2, 128, 4)
+        pool.get_value_buffer.return_value = torch.zeros(2, 128, 4)
+        backend.token_to_kv_pool = pool
+        backend.forward_metadata = SimpleNamespace(swa_out_cache_loc=None)
+        backend._iquest_attn_with_lse = MagicMock(return_value=("out", "lse"))
+        q = torch.zeros(2, 8)
+        layer = SimpleNamespace(layer_id=3)
+        forward_batch = SimpleNamespace(out_cache_loc=torch.zeros(2, dtype=torch.long))
+
+        result = backend.forward_decode_graph(
+            q, q, q, layer, forward_batch, True, return_lse=True
+        )
+
+        self.assertEqual(result, ("out", "lse"))
+        pool.set_kv_buffer.assert_called_once()
+        pool.get_key_buffer.assert_called_once_with(3)
+        pool.get_value_buffer.assert_called_once_with(3)
+        args = backend._iquest_attn_with_lse.call_args.args
+        self.assertIs(args[0], q)
+        self.assertIs(args[1], layer)
+        self.assertEqual(args[5], 2)  # num_token_padding == padded batch size
+
+    def test_forward_decode_graph_rejects_lse_with_sinks(self):
+        backend = self._backend()
+        pool = MagicMock()
+        backend.token_to_kv_pool = pool
+        backend.forward_metadata = SimpleNamespace(swa_out_cache_loc=None)
+        q = torch.zeros(2, 8)
+        layer = SimpleNamespace(layer_id=0)
+        forward_batch = SimpleNamespace(out_cache_loc=torch.zeros(2, dtype=torch.long))
+
+        with self.assertRaises(ValueError):
+            backend.forward_decode_graph(
+                q,
+                q,
+                q,
+                layer,
+                forward_batch,
+                True,
+                sinks=torch.zeros(2),
+                return_lse=True,
+            )
+
+    def test_forward_mixed_rejects_return_lse(self):
+        backend = self._backend()
+        with self.assertRaises(NotImplementedError):
+            backend.forward_mixed(
+                None, None, None, layer=None, forward_batch=None, return_lse=True
+            )
+
+    def _run_lse_helper(self, sliding_window_size):
+        backend = self._backend()
+        num_tokens, num_q_heads, head_dim = 2, 2, 4
+        seq_lens = [5, 7]
+        block_tables = torch.zeros(2, 1, dtype=torch.int32)
+        block_tables_swa = torch.ones(2, 1, dtype=torch.int32)
+        backend.forward_metadata = SimpleNamespace(
+            seq_lens_cpu_list=seq_lens,
+            seq_lens_cpu_int=None,
+            block_tables=block_tables,
+            block_tables_swa=block_tables_swa,
+        )
+        backend.fia_mask = torch.zeros(8, 8, dtype=torch.bool)
+
+        captured = []
+
+        def fake_fia(**kwargs):
+            captured.append(kwargs)
+            return (
+                torch.zeros(num_tokens, num_q_heads, head_dim),
+                torch.zeros(num_tokens, num_q_heads, 1),
+            )
+
+        q = torch.zeros(num_tokens, num_q_heads * head_dim)
+        k_cache = torch.zeros(2, 128, 4)
+        v_cache = torch.zeros(2, 128, 4)
+        layer = SimpleNamespace(
+            tp_q_head_num=num_q_heads,
+            qk_head_dim=head_dim,
+            tp_k_head_num=1,
+            tp_v_head_num=1,
+            v_head_dim=head_dim,
+            sliding_window_size=sliding_window_size,
+            scaling=0.125,
+            layer_id=0,
+        )
+        forward_batch = SimpleNamespace(
+            forward_mode=SimpleNamespace(is_decode=lambda: True)
+        )
+
+        with patch.object(
+            ascend_backend_mod.torch_npu,
+            "npu_fused_infer_attention_score_v2",
+            side_effect=fake_fia,
+        ):
+            attn_out, lse = backend._iquest_attn_with_lse(
+                q, layer, forward_batch, k_cache, v_cache, num_tokens
+            )
+
+        self.assertEqual(len(captured), 1)
+        self.assertEqual(attn_out.shape, (num_tokens, num_q_heads * head_dim))
+        self.assertEqual(lse.shape, (num_tokens, num_q_heads))
+        return captured[0], block_tables, block_tables_swa
+
+    def test_lse_helper_decode_uses_v2_host_side_kv_lengths(self):
+        kwargs, block_tables, _ = self._run_lse_helper(sliding_window_size=-1)
+
+        self.assertEqual(kwargs["actual_seq_qlen"], [1, 2])
+        self.assertEqual(kwargs["actual_seq_kvlen"], [5, 7])
+        self.assertIs(kwargs["block_table"], block_tables)
+        self.assertEqual(kwargs["sparse_mode"], 3)
+        self.assertEqual(kwargs["pre_tokens"], FULL_ATTENTION_WINDOW)
+        self.assertEqual(kwargs["next_tokens"], FULL_ATTENTION_WINDOW)
+        self.assertTrue(kwargs["return_softmax_lse"])
+        self.assertEqual(kwargs["input_layout"], "TND")
+
+    def test_lse_helper_decode_swa_layer_uses_swa_block_table(self):
+        kwargs, _, block_tables_swa = self._run_lse_helper(sliding_window_size=4096)
+
+        self.assertIs(kwargs["block_table"], block_tables_swa)
+        self.assertEqual(kwargs["sparse_mode"], 4)
+        self.assertEqual(kwargs["pre_tokens"], 4096)
+        self.assertEqual(kwargs["next_tokens"], 0)
 
 
 if __name__ == "__main__":

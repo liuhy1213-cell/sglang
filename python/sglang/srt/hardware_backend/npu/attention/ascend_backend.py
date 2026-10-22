@@ -2782,6 +2782,7 @@ class AscendAttnBackend(AttentionBackend):
         q_rope: Optional[torch.Tensor] = None,
         k_rope: Optional[torch.Tensor] = None,
         sinks: Optional[torch.Tensor] = None,
+        return_lse: bool = False,
     ):
         if save_kv_cache:
             if self.use_mla:
@@ -2800,6 +2801,25 @@ class AscendAttnBackend(AttentionBackend):
                     k,
                     v,
                 )
+
+        if return_lse:
+            # IQuest-Q1: the learned-sink correction consumes (out, lse) inside
+            # the model forward, so the LSE never leaves the captured graph.
+            # Reuse the eager helper: for a decode batch it already builds the
+            # same TND/FIA-v2 call as the graph path below, plus return_lse.
+            if sinks is not None:
+                raise ValueError(
+                    "return_lse and sinks are mutually exclusive on the graph "
+                    "decode path."
+                )
+            return self._iquest_attn_with_lse(
+                q,
+                layer,
+                forward_batch,
+                self.token_to_kv_pool.get_key_buffer(layer.layer_id),
+                self.token_to_kv_pool.get_value_buffer(layer.layer_id),
+                q.shape[0],
+            )
 
         if sinks is not None or self.is_hybrid_swa:
             # Use SWA block tables if hybrid SWA is enabled for this layer
@@ -3103,6 +3123,11 @@ class AscendAttnBackend(AttentionBackend):
                 q_rope=q_rope,
                 k_rope=k_rope,
                 sinks=sinks,
+                # Forward only the explicit model kwarg. mha_return_lse is the
+                # MLA chunked-prefix merge signal; the graph attention path
+                # does not implement that merge, so forwarding it would change
+                # other models' behavior.
+                return_lse=bool(kwargs.get("return_lse")),
             )
 
         if not self.use_mla:
@@ -3453,7 +3478,15 @@ class AscendAttnBackend(AttentionBackend):
         q_rope: Optional[torch.Tensor] = None,
         k_rope: Optional[torch.Tensor] = None,
         topk_indices: Optional[torch.Tensor] = None,
+        return_lse: bool = False,
     ):
+        if return_lse:
+            raise NotImplementedError(
+                "IQuest-Q1 learned-sink attention needs return_lse, which is "
+                "not implemented for mixed prefill+decode batches on Ascend "
+                "NPU. Do not pass --enable-mixed-chunk; chunked prefill "
+                "without mixed chunks is supported."
+            )
         if (
             topk_indices is not None
             or self.use_mla

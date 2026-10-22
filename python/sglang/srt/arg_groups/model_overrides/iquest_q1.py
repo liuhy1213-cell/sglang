@@ -22,9 +22,7 @@ def _iquest_q1_overrides(server_args: Any, hf_config: Any) -> dict:
         cfg.prefill_attention_backend,
         cfg.decode_attention_backend,
     )
-    if not on_npu and any(
-        backend not in (None, "fa3") for backend in requested
-    ):
+    if not on_npu and any(backend not in (None, "fa3") for backend in requested):
         raise ValueError(
             "IQuestQ1 applies its attention sink from the softmax LSE and "
             "requires FA3 attention for both prefill and decode."
@@ -47,6 +45,12 @@ def _iquest_q1_overrides(server_args: Any, hf_config: Any) -> dict:
     if cfg.pp_size > 1:
         raise ValueError("IQuest Q1 does not support pipeline parallelism.")
     if on_npu:
+        if cfg.enable_mixed_chunk:
+            raise ValueError(
+                "IQuest-Q1 on Ascend NPU requires --enable-mixed-chunk to be "
+                "off: mixed prefill+decode batches have no learned-sink LSE "
+                "path. Chunked prefill without mixed chunks is supported."
+            )
         # Keep the NPU backend selection untouched.
         return {}
     overrides = {}
